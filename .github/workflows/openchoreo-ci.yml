@@ -1,0 +1,269 @@
+# External CI workflow for OpenChoreo — helloworld-go sample
+#
+# This workflow builds a container image, pushes it to GHCR, and registers
+# the Workload with the OpenChoreo API (POST with 409→PUT fallback).
+# A GitOps alternative path is also provided using the occ CLI.
+#
+# Required GitHub secrets:
+#   OPENCHOREO_CLIENT_ID      — OAuth2 client ID (from Thunder IDP or your OIDC provider)
+#   OPENCHOREO_CLIENT_SECRET  — OAuth2 client secret
+#   OPENCHOREO_API_URL        — OpenChoreo API base URL  (e.g. https://api.openchoreo.example.com)
+#   OPENCHOREO_THUNDER_URL    — Thunder IDP URL           (e.g. https://thunder.example.com)
+#   GITOPS_REPO               — (gitops path only) owner/repo of the GitOps repo
+#   GITOPS_TOKEN              — (gitops path only) PAT with repo write access
+
+name: External CI - OpenChoreo
+
+"on":
+  workflow_dispatch:
+    inputs:
+      approach:
+        description: "Deployment approach"
+        required: true
+        default: "api"
+        type: choice
+        options:
+          - api
+          - gitops
+  push:
+    branches: [main]
+
+env:
+  NAMESPACE: full-flow-ns
+  PROJECT: samples
+  COMPONENT: helloworld-go
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
+  OCC_VERSION: v1.0.0
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ── 2. Docker Buildx ──────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 3. GHCR login ─────────────────────────────────────────────
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 4. Build & push image ─────────────────────────────────────
+      - name: Build and push container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.COMPONENT }}:${{ github.sha }}
+
+      # ── 5. Install tools ──────────────────────────────────────────
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Install occ CLI
+        run: |
+          curl -sL \
+            "https://github.com/openchoreo/openchoreo/releases/download/${{ env.OCC_VERSION }}/occ-linux-amd64" \
+            -o /usr/local/bin/occ
+          chmod +x /usr/local/bin/occ
+          occ version || echo "occ CLI installed (version command may not exist yet)"
+
+      # ────────────────────────────────────────────────────────────────
+      # API approach
+      # ────────────────────────────────────────────────────────────────
+
+      # ── 6. Obtain OAuth2 token ────────────────────────────────────
+      - name: Get OAuth2 access token
+        if: inputs.approach == 'api' || inputs.approach == ''
+        id: auth
+        run: |
+          set -euo pipefail
+          echo ">> Requesting token from ${{ secrets.OPENCHOREO_THUNDER_URL }}/oauth2/token"
+
+          RESPONSE=$(curl --fail-with-body --retry 3 --retry-delay 5 -s \
+            -X POST "${{ secrets.OPENCHOREO_THUNDER_URL }}/oauth2/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${{ secrets.OPENCHOREO_CLIENT_ID }}" \
+            -d "client_secret=${{ secrets.OPENCHOREO_CLIENT_SECRET }}")
+
+          TOKEN=$(echo "${RESPONSE}" | jq -r '.access_token')
+
+          if [ -z "${TOKEN}" ] || [ "${TOKEN}" = "null" ]; then
+            echo "::error::Failed to obtain access token. Response: ${RESPONSE}"
+            exit 1
+          fi
+
+          echo ">> Token acquired successfully"
+          echo "access_token=${TOKEN}" >> "$GITHUB_OUTPUT"
+
+      # ── 7a. Create or update Workload via API ─────────────────────
+      - name: Create/update Workload via OpenChoreo API
+        if: inputs.approach == 'api' || inputs.approach == ''
+        run: |
+          set -euo pipefail
+
+          API_URL="${{ secrets.OPENCHOREO_API_URL }}"
+          TOKEN="${{ steps.auth.outputs.access_token }}"
+          IMAGE="${{ env.REGISTRY }}/${{ env.COMPONENT }}:${{ github.sha }}"
+          WORKLOAD_NAME="${{ env.COMPONENT }}-workload"
+
+          # ── Build the correct Workload payload ──
+          # Schema: metadata.name, spec.owner.{projectName,componentName}, spec.container.image
+          PAYLOAD=$(jq -n \
+            --arg name   "${WORKLOAD_NAME}" \
+            --arg proj   "${{ env.PROJECT }}" \
+            --arg comp   "${{ env.COMPONENT }}" \
+            --arg image  "${IMAGE}" \
+            '{
+              metadata: { name: $name },
+              spec: {
+                owner: { projectName: $proj, componentName: $comp },
+                container: { image: $image },
+                endpoints: {
+                  http: {
+                    port: 8080,
+                    type: "HTTP",
+                    visibility: ["external"]
+                  }
+                }
+              }
+            }')
+
+          echo ">> Payload:"
+          echo "${PAYLOAD}" | jq .
+
+          # ── POST (create) ──
+          echo ">> POST ${API_URL}/api/v1/namespaces/${{ env.NAMESPACE }}/workloads"
+          RESPONSE=$(curl -sk -w "\n%{http_code}" \
+            --retry 3 --retry-delay 5 \
+            -X POST "${API_URL}/api/v1/namespaces/${{ env.NAMESPACE }}/workloads" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -d "${PAYLOAD}")
+
+          HTTP_CODE=$(echo "${RESPONSE}" | tail -1)
+          BODY=$(echo "${RESPONSE}" | sed '$d')
+
+          if [ "${HTTP_CODE}" -ge 200 ] && [ "${HTTP_CODE}" -lt 300 ]; then
+            echo ">> Workload created (HTTP ${HTTP_CODE})"
+            echo "${BODY}" | jq . 2>/dev/null || echo "${BODY}"
+            exit 0
+          fi
+
+          if [ "${HTTP_CODE}" -ne 409 ]; then
+            echo "::error::Failed to create workload (HTTP ${HTTP_CODE}): ${BODY}"
+            exit 1
+          fi
+
+          # ── 409 Conflict → GET existing → merge image → PUT ──
+          echo ">> Workload already exists (409). Fetching current state…"
+
+          GET_RESPONSE=$(curl -sk -w "\n%{http_code}" \
+            --retry 3 --retry-delay 5 \
+            -X GET "${API_URL}/api/v1/namespaces/${{ env.NAMESPACE }}/workloads/${WORKLOAD_NAME}" \
+            -H "Authorization: Bearer ${TOKEN}")
+
+          GET_CODE=$(echo "${GET_RESPONSE}" | tail -1)
+          GET_BODY=$(echo "${GET_RESPONSE}" | sed '$d')
+
+          if [ "${GET_CODE}" -lt 200 ] || [ "${GET_CODE}" -ge 300 ]; then
+            echo "::error::Failed to GET existing workload (HTTP ${GET_CODE}): ${GET_BODY}"
+            exit 1
+          fi
+
+          # Merge only the container image into the existing workload
+          MERGED=$(echo "${GET_BODY}" | jq --arg img "${IMAGE}" '.spec.container.image = $img')
+
+          echo ">> PUT ${API_URL}/api/v1/namespaces/${{ env.NAMESPACE }}/workloads/${WORKLOAD_NAME}"
+          PUT_RESPONSE=$(curl -sk -w "\n%{http_code}" \
+            --retry 3 --retry-delay 5 \
+            -X PUT "${API_URL}/api/v1/namespaces/${{ env.NAMESPACE }}/workloads/${WORKLOAD_NAME}" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -d "${MERGED}")
+
+          PUT_CODE=$(echo "${PUT_RESPONSE}" | tail -1)
+          PUT_BODY=$(echo "${PUT_RESPONSE}" | sed '$d')
+
+          if [ "${PUT_CODE}" -ge 200 ] && [ "${PUT_CODE}" -lt 300 ]; then
+            echo ">> Workload updated (HTTP ${PUT_CODE})"
+            echo "${PUT_BODY}" | jq . 2>/dev/null || echo "${PUT_BODY}"
+          else
+            echo "::error::Failed to update workload (HTTP ${PUT_CODE}): ${PUT_BODY}"
+            exit 1
+          fi
+
+      # ────────────────────────────────────────────────────────────────
+      # GitOps approach
+      # ────────────────────────────────────────────────────────────────
+
+      # ── 7b. Clone GitOps repo ─────────────────────────────────────
+      - name: Clone GitOps repo
+        if: inputs.approach == 'gitops'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GITOPS_REPO }}
+          token: ${{ secrets.GITOPS_TOKEN }}
+          path: gitops-repo
+
+      # ── 8. Generate manifests with occ CLI ────────────────────────
+      - name: Generate resources with occ CLI
+        if: inputs.approach == 'gitops'
+        run: |
+          set -euo pipefail
+
+          IMAGE="${{ env.REGISTRY }}/${{ env.COMPONENT }}:${{ github.sha }}"
+          RELEASE_NAME="${{ env.COMPONENT }}-$(date +%Y%m%d%H%M%S)"
+
+          echo ">> Creating/updating workload via occ CLI"
+          occ workload create \
+            --mode file-system \
+            --root-dir gitops-repo \
+            --project ${{ env.PROJECT }} \
+            --component ${{ env.COMPONENT }} \
+            --image "${IMAGE}"
+
+          echo ">> Generating ComponentRelease: ${RELEASE_NAME}"
+          occ componentrelease generate \
+            --mode file-system \
+            --root-dir gitops-repo \
+            --project ${{ env.PROJECT }} \
+            --component ${{ env.COMPONENT }} \
+            --name "${RELEASE_NAME}" \
+            --output-path "gitops-repo/namespaces/${{ env.NAMESPACE }}/projects/${{ env.PROJECT }}/components/${{ env.COMPONENT }}/releases"
+
+          echo ">> Generating ReleaseBinding"
+          occ releasebinding generate \
+            --mode file-system \
+            --root-dir gitops-repo \
+            --project ${{ env.PROJECT }} \
+            --component ${{ env.COMPONENT }} \
+            --component-release "${RELEASE_NAME}"
+
+      # ── 9. Push GitOps PR ─────────────────────────────────────────
+      - name: Create GitOps PR
+        if: inputs.approach == 'gitops'
+        working-directory: gitops-repo
+        run: |
+          set -euo pipefail
+          BRANCH="release/${{ env.COMPONENT }}-$(date +%Y%m%d%H%M%S)"
+          git checkout -b "${BRANCH}"
+          git add .
+          git commit -m "release: ${{ env.COMPONENT }} image ${{ github.sha }}"
+          git push origin "${BRANCH}"
+          gh pr create \
+            --title "Release ${{ env.COMPONENT }}" \
+            --body "Auto-generated by external CI workflow. Image: ${{ env.REGISTRY }}/${{ env.COMPONENT }}:${{ github.sha }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_TOKEN }}
