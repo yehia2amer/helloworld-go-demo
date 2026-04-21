@@ -1,0 +1,20 @@
+# OpenChoreo Workload Descriptor for helloworld-go
+# Place this file in the root of the application repository.
+# The external CI workflow reads this to determine endpoints and config,
+# then creates/updates the Workload resource via the OpenChoreo API.
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: helloworld-go-workload
+spec:
+  owner:
+    projectName: samples
+    componentName: helloworld-go
+  container:
+    image: placeholder
+  endpoints:
+    http:
+      port: 8080
+      type: HTTP
+      visibility:
+        - external
